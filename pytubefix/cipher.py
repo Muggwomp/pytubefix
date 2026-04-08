@@ -823,6 +823,7 @@ class Cipher:
                     continue
 
                 mask = int(branch_m.group(1))
+                target_norm = _normalize_js_cond(f'({pname}&{mask})=={pname}')
                 extra_conds = []
                 extra_patterns = [
                     r'\(\(\s*' + re.escape(pname) + r'\s*\|\s*\d+\)\s*&\s*\d+\)\s*<\s*\d+\s*&&\s*'
@@ -830,9 +831,13 @@ class Cipher:
                     r'\b' + re.escape(pname) + r'\s*-\s*\d+\s*>>\s*\d+\s*>=\s*0\s*&&\s*'
                     r'\(\s*' + re.escape(pname) + r'\s*-\s*\d+\s*&\s*\d+\)\s*<\s*\d+',
                     r'\(\s*' + re.escape(pname) + r'\s*\|\s*\d+\)\s*==\s*' + re.escape(pname),
+                    r'\(\s*' + re.escape(pname) + r'\s*&\s*\d+\)\s*==\s*' + re.escape(pname),
                 ]
                 for extra_pat in extra_patterns:
-                    extra_conds.extend(m.group(0) for m in re.finditer(extra_pat, body))
+                    for match in re.finditer(extra_pat, body):
+                        cond = match.group(0)
+                        if _normalize_js_cond(cond) != target_norm and cond not in extra_conds:
+                            extra_conds.append(cond)
 
                 for x_candidate in range(0, 256):
                     if (x_candidate & mask) != x_candidate:
