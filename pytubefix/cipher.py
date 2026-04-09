@@ -927,6 +927,7 @@ class Cipher:
             # Look for if(...) followed immediately by label:{
             # We search for all occurrences and manually extract the condition
             all_conds = []
+            all_if_conds = _extract_if_conditions(pre_split)
             # Find all "if(" positions
             for if_match in re.finditer(r'if\s*\(', pre_split):
                 if_start = if_match.end() - 1  # Position of opening (
@@ -953,14 +954,27 @@ class Cipher:
                 for pname in param_names:
                     if pname not in nsig_cond:
                         continue
-                    for x_candidate in range(0, 256):
-                        try:
-                            if _eval_js_branch(nsig_cond, pname, x_candidate):
-                                X = x_candidate
-                                F = I ^ X
-                                break
-                        except Exception:
+                    target_norm = _normalize_js_cond(nsig_cond)
+                    extra_conds = []
+                    for other_cond in all_if_conds:
+                        if pname not in other_cond:
                             continue
+                        if _normalize_js_cond(other_cond) == target_norm:
+                            continue
+                        extra_conds.append(other_cond)
+
+                    picked = _pick_branch_candidate(
+                        pname,
+                        lambda x_candidate, cond=nsig_cond, pname=pname: _eval_js_branch(
+                            cond, pname, x_candidate
+                        ),
+                        extra_conds
+                    )
+                    if picked is None:
+                        continue
+                    X, _ = picked
+                    F = I ^ X
+                    break
                     if X is not None:
                         break
                 if X is not None:
