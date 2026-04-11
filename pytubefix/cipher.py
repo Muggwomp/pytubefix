@@ -10,7 +10,6 @@ signs the media URL with the output.
 This module is responsible for (1) finding these "transformations
 functions" (2) sends them to be interpreted by nodejs
 """
-import json
 import logging
 import re
 import time
@@ -18,7 +17,10 @@ from typing import Optional
 
 from pytubefix.exceptions import RegexMatchError, InterpretationError
 from pytubefix.jsinterp import JSInterpreter, extract_player_js_global_var
-from pytubefix.sig_nsig.node_runner import NodeRunner
+from pytubefix.sig_nsig.node_runner import (
+    NodeRunner,
+    NodeRunnerEmptyResponseError,
+)
 
 MAX_RETRIES = 3
 RETRY_DELAY = 0.5
@@ -49,12 +51,8 @@ class Cipher:
 
     @staticmethod
     def _is_empty_response_error(exc: Exception) -> bool:
-        """Check if the exception is caused by an empty Node.js response."""
-        return isinstance(exc, json.JSONDecodeError) or (
-            isinstance(exc, Exception)
-            and "Expecting value" in str(exc)
-            and "char 0" in str(exc)
-        )
+        """Check if the exception is caused by a retryable Node.js transport miss."""
+        return isinstance(exc, NodeRunnerEmptyResponseError)
 
     def _call_with_retry(self, runner, args, label="call"):
         """Call NodeRunner with retry logic for empty response errors."""
@@ -70,12 +68,8 @@ class Cipher:
                     )
                     last_exc = e
                     time.sleep(RETRY_DELAY * attempt)
-                    # Reinitialize the runner in case the Node.js process died
                     try:
-                        runner.load_function(
-                            self.nsig_function_name if "nsig" in label
-                            else self.sig_function_name
-                        )
+                        runner.restart()
                     except Exception:
                         pass
                     continue
