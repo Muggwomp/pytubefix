@@ -16,6 +16,7 @@ from pytubefix.chapters import Chapter
 from pytubefix.keymoments import KeyMoment
 from pytubefix.query import CaptionQuery, StreamQuery
 from pytubefix.__main__ import YouTube
+from pytubefix.potoken_manager import PoTokenManager, PoTokenRecord
 from pytubefix.async_youtube import AsyncYouTube
 from pytubefix.contrib.playlist import Playlist
 from pytubefix.contrib.channel import Channel

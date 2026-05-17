@@ -31,6 +31,7 @@ smaller peripheral modules and functions.
 """
 
 import logging
+import os
 from subprocess import CalledProcessError
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -43,6 +44,8 @@ from pytubefix.innertube import InnerTube
 from pytubefix.metadata import YouTubeMetadata
 from pytubefix.monostate import Monostate
 from pytubefix.botGuard import bot_guard
+from pytubefix.potoken_manager import PoTokenManager, PoTokenRecord
+from pytubefix.sabr_po_token_provider import BrowserSabrPoTokenProvider
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +66,12 @@ class YouTube:
             oauth_verifier: Optional[Callable[[str, str], None]] = None,
             use_po_token: Optional[bool] = False,
             po_token_verifier: Optional[Callable[[None], Tuple[str, str]]] = None,
+            po_token_manager: Optional[PoTokenManager] = None,
+            visitor_data: Optional[str] = None,
+            po_token: Optional[str] = None,
+            po_token_ttl_seconds: Optional[int] = None,
+            sabr_po_token_provider: Optional[Any] = None,
+            sabr_po_token_ttl_seconds: Optional[int] = None,
     ):
         """Construct a :class:`YouTube <YouTube>`.
 
@@ -96,6 +105,16 @@ class YouTube:
             (optional) Verifier to be used for getting oauth tokens.
             Verification URL and User-Code will be passed to it respectively.
             (if passed, else default verifier will be used)
+        :param str visitor_data:
+            (Optional) visitorData paired with a manually imported PoToken.
+        :param str po_token:
+            (Optional) Manually supplied PoToken for this video/client.
+        :param int po_token_ttl_seconds:
+            (Optional) TTL for a manually supplied PoToken.
+        :param sabr_po_token_provider:
+            (Optional) Provider used to capture/store SABR-scoped PoTokens.
+        :param int sabr_po_token_ttl_seconds:
+            (Optional) TTL for SABR-scoped PoTokens.
         """
         # js fetched by js_url
         self._js: Optional[str] = None
@@ -165,6 +184,17 @@ class YouTube:
 
         self.po_token = None
         self._pot = None
+        self.po_token_manager = po_token_manager or PoTokenManager()
+        self.sabr_po_token_provider = sabr_po_token_provider
+        self.sabr_po_token_ttl_seconds = sabr_po_token_ttl_seconds or 15 * 60
+        if visitor_data or po_token:
+            if not visitor_data or not po_token:
+                raise ValueError("visitor_data and po_token must be provided together")
+            self.import_po_token(
+                visitor_data=visitor_data,
+                po_token=po_token,
+                ttl_seconds=po_token_ttl_seconds,
+            )
 
     def __repr__(self):
         return f'<pytubefix.__main__.YouTube object: videoId={self.video_id}>'
@@ -266,6 +296,180 @@ class YouTube:
         except Exception as e:
             logger.warning('Unable to run botGuard. Skipping poToken generation, reason: ' + e.__str__())
         return self._pot
+
+    def _get_or_create_po_token_record(self, client: str) -> Optional[PoTokenRecord]:
+        visitor_data = self.visitor_data
+        record = self.po_token_manager.get(
+            client=client,
+            video_id=self.video_id,
+            visitor_data=visitor_data,
+        )
+        if record:
+            self.po_token = record.po_token
+            self._pot = record.po_token
+            return record
+
+        po_token = self.pot
+        if not po_token:
+            return None
+
+        record = self.po_token_manager.put(
+            client=client,
+            video_id=self.video_id,
+            visitor_data=visitor_data,
+            po_token=po_token,
+            source="botguard_auto",
+        )
+        self.po_token = record.po_token
+        return record
+
+    def import_po_token(
+            self,
+            *,
+            visitor_data: str,
+            po_token: str,
+            client: Optional[str] = None,
+            video_id: Optional[str] = None,
+            ttl_seconds: Optional[int] = None,
+    ) -> PoTokenRecord:
+        """Import a known-good PoToken pair into this instance's cache."""
+        record = self.po_token_manager.import_token(
+            client=client or self.client,
+            visitor_data=visitor_data,
+            po_token=po_token,
+            video_id=self.video_id if video_id is None else video_id,
+            source="manual_import",
+            ttl_seconds=ttl_seconds,
+        )
+
+        if record.client == self.client.upper() and record.video_id == self.video_id:
+            self._visitor_data = record.visitor_data
+            self.po_token = record.po_token
+            self._pot = record.po_token
+            self._vid_info = None
+            self._fmt_streams = None
+
+        return record
+
+    def _get_sabr_po_token_provider(self):
+        if self.sabr_po_token_provider:
+            return self.sabr_po_token_provider
+
+        provider_mode = os.environ.get("PYTUBEFIX_SABR_BROWSER_PROVIDER", "auto").lower()
+        if provider_mode in {"0", "false", "off", "no"}:
+            return None
+
+        if provider_mode in {"1", "true", "on", "yes", "auto"}:
+            self.sabr_po_token_provider = BrowserSabrPoTokenProvider()
+            return self.sabr_po_token_provider
+
+        return None
+
+    def get_or_create_sabr_po_token_record(
+            self,
+            client: Optional[str] = None,
+            reason: str = "",
+    ) -> Optional[PoTokenRecord]:
+        """Resolve a SABR body PoToken without mixing it with playback tokens."""
+        client = client or self.client
+        visitor_data = self.visitor_data
+        record = self.po_token_manager.get(
+            client=client,
+            video_id=self.video_id,
+            scope="sabr",
+            visitor_data=visitor_data,
+        )
+        if record:
+            return record
+
+        provider = self._get_sabr_po_token_provider()
+        if not provider:
+            return None
+
+        reason_text = f" ({reason})" if reason else ""
+        logger.debug(f"Resolving SABR PoToken for {client}{reason_text}")
+        result = provider.fetch(
+            url=self.watch_url,
+            video_id=self.video_id,
+            client=client,
+            visitor_data=visitor_data,
+        )
+        return self.po_token_manager.put(
+            client=client,
+            video_id=self.video_id,
+            visitor_data=visitor_data,
+            po_token=result.po_token,
+            source=result.source,
+            scope="sabr",
+            ttl_seconds=self.sabr_po_token_ttl_seconds,
+        )
+
+    def import_sabr_po_token(
+            self,
+            *,
+            visitor_data: str,
+            po_token: str,
+            client: Optional[str] = None,
+            video_id: Optional[str] = None,
+            ttl_seconds: Optional[int] = None,
+            source: str = "manual_sabr_import",
+    ) -> PoTokenRecord:
+        """Import a known-good SABR body PoToken into the SABR cache scope."""
+        return self.po_token_manager.import_token(
+            client=client or self.client,
+            visitor_data=visitor_data,
+            po_token=po_token,
+            video_id=self.video_id if video_id is None else video_id,
+            scope="sabr",
+            source=source,
+            ttl_seconds=ttl_seconds or self.sabr_po_token_ttl_seconds,
+        )
+
+    def invalidate_sabr_po_token(
+            self,
+            client: Optional[str] = None,
+    ) -> bool:
+        """Drop cached SABR PoTokens for this video/client pair."""
+        return self.po_token_manager.invalidate(
+            client=client or self.client,
+            video_id=self.video_id,
+            scope="sabr",
+        )
+
+    def refresh_po_token_for_playback(
+            self,
+            client: Optional[str] = None,
+            reason: str = "",
+    ) -> Optional[str]:
+        """Invalidate playback PoToken state and refresh the player response."""
+        client = client or self.client
+        innertube = InnerTube(client)
+        if not innertube.require_po_token or self.use_po_token:
+            return None
+
+        reason_text = f" ({reason})" if reason else ""
+        logger.debug(f"Refreshing playback PoToken for {client}{reason_text}")
+
+        self.po_token_manager.invalidate(client=client, video_id=self.video_id)
+        self.po_token_manager.invalidate(client=client)
+
+        self.po_token = None
+        self._pot = None
+        self._visitor_data = None
+        self._vid_info = None
+        self._fmt_streams = None
+
+        record = self._get_or_create_po_token_record(client)
+        if not record:
+            logger.warning("Unable to refresh playback PoToken")
+            return None
+
+        try:
+            self.vid_info_client(optional_client=client)
+        except Exception as exc:
+            logger.warning(f"Unable to refresh player response after PoToken refresh: {exc}")
+
+        return record.po_token
 
     @property
     def initial_data(self):
@@ -522,8 +726,15 @@ class YouTube:
             # Automatically generates a poToken
             if innertube.require_po_token and not self.use_po_token:
                 logger.debug(f"The {optional_client} client requires poToken to obtain functional streams")
-                logger.debug("Automatically generating poToken")
-                innertube.insert_visitor_data(visitor_data=self.visitor_data)
+                logger.debug("Resolving poToken before player request")
+                record = self._get_or_create_po_token_record(optional_client)
+                if record:
+                    innertube.access_visitorData = record.visitor_data
+                    innertube.access_po_token = record.po_token
+                    innertube.insert_po_token()
+                else:
+                    logger.debug("Unable to resolve poToken, sending visitorData only")
+                    innertube.insert_visitor_data(visitor_data=self.visitor_data)
             elif not self.use_po_token:
                 # from 01/22/2025 all clients must send the visitorData in the API request
                 innertube.insert_visitor_data(visitor_data=self.visitor_data)
@@ -531,7 +742,9 @@ class YouTube:
             response = innertube.player(self.video_id)
 
             # Retrieves the sent poToken
-            if self.use_po_token or innertube.require_po_token:
+            if self.use_po_token:
+                self.po_token = innertube.access_po_token or self.pot
+            elif innertube.require_po_token and not self.po_token:
                 self.po_token = innertube.access_po_token or self.pot
             return response
 

@@ -3,15 +3,19 @@
 import enum
 import base64
 import logging
+import os
 from enum import Enum
 from time import sleep
 from typing import Optional
 from collections.abc import Callable
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
 from pytubefix.sabr.core.UMP import UMP
 from pytubefix.monostate import Monostate
 from pytubefix.exceptions import SABRError
+from pytubefix.innertube import InnerTube
+from pytubefix.sabr.proto import BinaryReader
 from pytubefix.sabr.video_streaming.sabr_error import SabrError
 from pytubefix.sabr.video_streaming.media_header import MediaHeader
 from pytubefix.sabr.core.chunked_data_buffer import ChunkedDataBuffer
@@ -86,6 +90,7 @@ class ServerAbrStream:
         self.stream = stream
         self.write_chunk = write_chunk
         self.youtube = monostate.youtube
+        self.sabr_client_info, self.sabr_headers = self._build_sabr_client_metadata()
         self.po_token = self.stream.po_token
         self.server_abr_streaming_url = self.stream.url
         self.video_playback_ustreamer_config = self.stream.video_playback_ustreamer_config
@@ -98,9 +103,41 @@ class ServerAbrStream:
         self.previous_sequences = {}
         self.RELOAD = False
         self.maximum_reload_attempt = 4
+        self.maximum_context_update_attempt = 15
+        self.context_update_attempt = 0
+        self.maximum_pending_no_media_attempt = 20
+        self.pending_no_media_attempt = 0
         self.stream_protection_status = PoTokenStatus.UNKNOWN.name
+        self.maximum_po_token_refresh_attempt = 8
+        self.po_token_refresh_attempts = 0
         self.sabr_contexts_to_send = []
+        self.sabr_unsent_contexts = []
         self.sabr_context_updates = dict()
+        self.sabr_trace_enabled = os.environ.get("PYTUBEFIX_SABR_TRACE") == "1"
+        self.sabr_po_token_source = None
+        sabr_record = self._get_sabr_po_token_record()
+        if sabr_record:
+            self.po_token = sabr_record.po_token
+            self.stream.po_token = sabr_record.po_token
+            self.sabr_po_token_source = sabr_record.source
+
+        env_sabr_token = os.environ.get("PYTUBEFIX_SABR_BODY_PO_TOKEN")
+        if env_sabr_token:
+            self.po_token = env_sabr_token
+            self.stream.po_token = env_sabr_token
+            self.sabr_po_token_source = "env"
+
+        self.browser_like_enabled = (
+            os.environ.get("PYTUBEFIX_SABR_BROWSER_LIKE") == "1"
+            or sabr_record is not None
+            or env_sabr_token is not None
+        )
+        if self.browser_like_enabled:
+            self.server_abr_streaming_url = self._strip_url_query_param(
+                self.server_abr_streaming_url,
+                "pot",
+            )
+            self.stream.url = self.server_abr_streaming_url
 
     def emit(self, data):
         for formatId in data['initialized_formats']:
@@ -112,24 +149,19 @@ class ServerAbrStream:
 
     def start(self):
 
-        audio_format = [{'itag': self.stream.itag,
-                         'lastModified': int(self.stream.last_Modified),
-                         'xtags': self.stream.xtags}] if self.stream.type == 'audio' else []
-
-        video_format = [{'itag': self.stream.itag,
-                         'lastModified': int(self.stream.last_Modified),
-                         'xtags': self.stream.xtags}] if self.stream.type == 'video' else []
+        audio_format, video_format = self._build_selected_format_candidates()
+        selected_resolution = self._selected_resolution(video_format)
 
         client_abr_state = {
             'lastManualDirection': 0,
             'timeSinceLastManualFormatSelectionMs': 0,
-            'lastManualSelectedResolution': int(self.stream.resolution.replace('p', '')) if video_format else 720,
-            'stickyResolution': int(self.stream.resolution.replace('p', '')) if video_format else 720,
+            'lastManualSelectedResolution': selected_resolution,
+            'stickyResolution': selected_resolution,
             'playerTimeMs': 0,
             'visibility': 0,
             'drcEnabled': self.stream.is_drc,
             # 0 = BOTH, 1 = AUDIO (video-only is no longer supported by YouTube)
-            'enabledTrackTypesBitfield': 0 if video_format else 1
+            'enabledTrackTypesBitfield': 0 if video_format or self.browser_like_enabled else 1
         }
         while client_abr_state['playerTimeMs'] < self.totalDurationMs:
             data = self.fetch_media(client_abr_state, audio_format, video_format)
@@ -139,12 +171,6 @@ class ServerAbrStream:
                 self.reload()
 
             self.emit(data)
-
-            if data.get("sabr_context_update"):
-                if self.maximum_reload_attempt > 0:
-                    continue
-                else:
-                    raise SABRError("SABR failed to update context after exhausting reload attempts")
 
             # Determine main format
             if client_abr_state["enabledTrackTypesBitfield"] == 0:
@@ -161,11 +187,39 @@ class ServerAbrStream:
                 sequence_numbers = [seq.get("sequenceNumber", 0) for seq in fmt.get("sequenceList", [])]
                 self.previous_sequences[format_key] = sequence_numbers
 
+            has_sequence_chunks = main_format is not None and bool(main_format.get("sequenceList"))
+
+            if has_sequence_chunks:
+                self.context_update_attempt = 0
+                self.pending_no_media_attempt = 0
+
+            if self._recover_invalid_po_token():
+                continue
+
+            if data.get("sabr_context_update") and not has_sequence_chunks:
+                self.context_update_attempt += 1
+                if self.context_update_attempt <= self.maximum_context_update_attempt:
+                    continue
+                raise SABRError(
+                    "SABR failed to update context after exhausting "
+                    f"{self.maximum_context_update_attempt} no-progress context update attempts"
+                )
+
             # Check if server returned usable chunks
             if not self.RELOAD and (
                     main_format is None or
                     not main_format.get("sequenceList")
             ):
+                if self.stream_protection_status == PoTokenStatus.PENDING.name:
+                    self.pending_no_media_attempt += 1
+                    if self.pending_no_media_attempt <= self.maximum_pending_no_media_attempt:
+                        logger.warning(
+                            "SABR PoToken is PENDING with no media; waiting before retry (%s/%s)",
+                            self.pending_no_media_attempt,
+                            self.maximum_pending_no_media_attempt,
+                        )
+                        sleep(1)
+                        continue
                 logger.debug("SABR No chunks returned by the ABR server, triggering reload")
                 self.reload()
 
@@ -175,6 +229,8 @@ class ServerAbrStream:
                     self.RELOAD = False
                     continue
                 else:
+                    if self._recover_invalid_po_token():
+                        continue
                     raise SABRError(
                         f"SABR Maximum reload attempts reached. Stream protection status: PoToken {self.stream_protection_status}"
                     )
@@ -191,6 +247,17 @@ class ServerAbrStream:
             client_abr_state["playerTimeMs"] += total_sequence_duration
 
     def fetch_media(self, client_abr_state, audio_format, video_format):
+        if self.sabr_trace_enabled:
+            logger.warning(
+                "SABR request: playerTimeMs=%s selectedAudio=%s selectedVideo=%s selected=%s buffered=%s contexts=%s unsent=%s",
+                client_abr_state.get("playerTimeMs"),
+                audio_format,
+                video_format,
+                [fmt["formatId"] for fmt in self.initialized_formats],
+                [fmt["_state"] for fmt in self.initialized_formats],
+                self.sabr_contexts_to_send,
+                self.sabr_unsent_contexts,
+            )
         body = VideoPlaybackAbrRequest.encode({
             'clientAbrState': client_abr_state,
             'selectedAudioFormatIds': audio_format,
@@ -202,17 +269,11 @@ class ServerAbrStream:
                     ctx
                     for ctx in self.sabr_context_updates.values() if ctx["type"] in self.sabr_contexts_to_send
                 ],
-                'field6': [],
+                'field6': self.sabr_unsent_contexts,
                 'poToken': self.base64_to_u8(self.po_token) if self.po_token else None,
                 'playbackCookie': PlaybackCookie.encode(
                     self.playback_cookie).finish() if self.playback_cookie else None,
-                'clientInfo': {
-                    'clientName': 1,
-                    'clientVersion': '2.20250523.01.00',
-                    'osName': 'Windows',
-                    'osVersion': '10.0',
-                    'platform': 'DESKTOP'
-                }
+                'clientInfo': self.sabr_client_info
             },
             'bufferedRanges': [fmt["_state"] for fmt in self.initialized_formats],
             'field1000': []
@@ -221,8 +282,33 @@ class ServerAbrStream:
         base_headers = {
             "User-Agent": "Mozilla/5.0", "accept-language": "en-US,en", "Content-Type": "application/vnd.yt-ump",
         }
+        base_headers.update(self.sabr_headers)
         request = Request(self.server_abr_streaming_url, headers=base_headers, method="POST", data=bytes(body))
-        return self.parse_ump_response(bytes(urlopen(request).read()))
+        parsed_response = self.parse_ump_response(bytes(urlopen(request).read()))
+        if self.sabr_trace_enabled:
+            logger.warning(
+                "SABR response state: status=%s formats=%s",
+                self.stream_protection_status,
+                [
+                    {
+                        "format": fmt["formatId"],
+                        "sequenceCount": fmt["sequenceCount"],
+                        "sequences": [
+                            {
+                                "sequenceNumber": seq.get("sequenceNumber"),
+                                "durationMs": seq.get("durationMs"),
+                                "startMs": seq.get("startMs"),
+                                "contentLength": seq.get("contentLength"),
+                            }
+                            for seq in fmt.get("sequenceList", [])
+                        ],
+                        "state": fmt["_state"],
+                        "mediaBytes": sum(len(chunk) for chunk in fmt.get("mediaChunks", [])),
+                    }
+                    for fmt in self.initialized_formats
+                ],
+            )
+        return parsed_response
 
     def parse_ump_response(self, response):
         self.header_id_to_format_key_map.clear()
@@ -233,11 +319,13 @@ class ServerAbrStream:
         sabr_error: Optional[SabrError] = None
         sabr_redirect: Optional[SabrRedirect] = None
         sabr_context_update: bool = False
+        part_counts = {}
 
         ump = UMP(ChunkedDataBuffer([response]))
 
         def callback(part):
             data = list(part['data'].chunks[0] if part['data'].chunks else [])
+            part_counts[part["type"]] = part_counts.get(part["type"], 0) + 1
 
             if part['type'] == PART.MEDIA_HEADER.value:
                 self.process_media_header(data)
@@ -281,11 +369,20 @@ class ServerAbrStream:
                 sabr_context_update = True
                 self.process_sabr_context_update(data)
 
+            elif part["type"] == PART.SABR_CONTEXT_SENDING_POLICY.value:
+                self.process_sabr_context_sending_policy(data)
+
             elif part["type"] == PART.SNACKBAR_MESSAGE.value:  # This forces you to wait for the time to be able to skip the ad.
                 sabr_context_update = True
                 self.process_snackbar_message()
 
         ump.parse(callback)
+        if self.sabr_trace_enabled:
+            named_counts = {
+                PART(part_type).name if part_type in PART._value2member_map_ else str(part_type): count
+                for part_type, count in sorted(part_counts.items())
+            }
+            logger.warning("SABR part counts: %s", named_counts)
 
         return {
             "initialized_formats": self.initialized_formats,
@@ -376,7 +473,6 @@ class ServerAbrStream:
         logger.warning(f"SABR YouTube is forcing ads, wait {skip} seconds to skip")
 
         sleep(skip)
-        self.maximum_reload_attempt -= 1
 
     # Reference https://github.com/coletdjnz/yt-dlp-dev/blob/5c0c296/yt_dlp/extractor/youtube/_streaming/sabr/stream.py
     def process_stream_protection_status(self, data):
@@ -398,6 +494,203 @@ class ServerAbrStream:
 
         logger.debug(f"Stream Protection Status: PoToken {self.stream_protection_status}")
 
+    def process_sabr_context_sending_policy(self, data):
+        """Apply the server's context-send policy where the schema is known."""
+        policy = self.decode_sabr_context_sending_policy(data)
+        send_contexts = policy.get("send", [])
+        unsent_contexts = policy.get("unsent", [])
+        stop_contexts = policy.get("stop", [])
+
+        for context_type in stop_contexts:
+            if context_type in self.sabr_contexts_to_send:
+                self.sabr_contexts_to_send.remove(context_type)
+
+        for context_type in send_contexts:
+            if context_type in self.sabr_context_updates and context_type not in self.sabr_contexts_to_send:
+                self.sabr_contexts_to_send.append(context_type)
+
+        self.sabr_unsent_contexts = [
+            context_type
+            for context_type in unsent_contexts
+            if context_type not in self.sabr_context_updates
+        ]
+
+        if self.sabr_trace_enabled:
+            logger.warning(
+                "SABR context sending policy: %s active=%s unsent=%s",
+                policy,
+                self.sabr_contexts_to_send,
+                self.sabr_unsent_contexts,
+            )
+
+    @staticmethod
+    def decode_sabr_context_sending_policy(data):
+        reader = BinaryReader(data)
+        policy = {"send": [], "unsent": [], "stop": [], "unknown": {}}
+
+        while reader.pos < reader.len:
+            tag = reader.uint32()
+            field_number = tag >> 3
+            wire_type = tag & 7
+
+            if wire_type == 0:
+                value = reader.int32()
+                if field_number == 1:
+                    policy["send"].append(value)
+                elif field_number == 2:
+                    policy["unsent"].append(value)
+                elif field_number == 3:
+                    policy["stop"].append(value)
+                else:
+                    policy["unknown"].setdefault(field_number, []).append(value)
+                continue
+
+            if wire_type == 2 and field_number in (1, 2, 3):
+                end = reader.uint32() + reader.pos
+                values = []
+                while reader.pos < end:
+                    values.append(reader.int32())
+                if field_number == 1:
+                    policy["send"].extend(values)
+                elif field_number == 2:
+                    policy["unsent"].extend(values)
+                else:
+                    policy["stop"].extend(values)
+                continue
+
+            raw_value = reader.skip(wire_type)
+            policy["unknown"].setdefault(field_number, []).append(
+                base64.b64encode(bytes(raw_value)).decode("ascii")
+            )
+
+        return policy
+
+    def _get_sabr_po_token_record(self, reason: str = ""):
+        get_sabr_record = getattr(self.youtube, "get_or_create_sabr_po_token_record", None)
+        if not callable(get_sabr_record):
+            return None
+        try:
+            return get_sabr_record(client=self.youtube.client, reason=reason)
+        except Exception as exc:
+            logger.warning("Unable to resolve SABR PoToken: %s", exc)
+            return None
+
+    def _refresh_sabr_po_token(self) -> Optional[str]:
+        invalidate_sabr = getattr(self.youtube, "invalidate_sabr_po_token", None)
+        if callable(invalidate_sabr):
+            invalidate_sabr(client=self.youtube.client)
+
+        record = self._get_sabr_po_token_record(
+            reason="SABR stream protection reported INVALID"
+        )
+        if not record:
+            return None
+
+        self.sabr_po_token_source = record.source
+        return record.po_token
+
+    def _recover_invalid_po_token(self):
+        if self.stream_protection_status != PoTokenStatus.INVALID.name:
+            return False
+        if self.po_token_refresh_attempts >= self.maximum_po_token_refresh_attempt:
+            logger.warning(
+                "SABR PoToken remained INVALID after %s refresh attempt(s)",
+                self.po_token_refresh_attempts,
+            )
+            return False
+
+        old_po_token = self.po_token
+        self.po_token_refresh_attempts += 1
+        logger.warning(
+            "SABR reported invalid PoToken, refreshing token state (%s/%s)",
+            self.po_token_refresh_attempts,
+            self.maximum_po_token_refresh_attempt,
+        )
+        new_po_token = None
+        if self.browser_like_enabled or self.sabr_po_token_source:
+            new_po_token = self._refresh_sabr_po_token()
+        if not new_po_token:
+            refresh_po_token = getattr(self.youtube, "refresh_po_token_for_playback", None)
+            if not callable(refresh_po_token):
+                return False
+            new_po_token = refresh_po_token(
+                reason="SABR stream protection reported INVALID"
+            )
+        if not new_po_token:
+            logger.warning("SABR PoToken refresh returned no replacement token")
+            return False
+
+        self.po_token = new_po_token
+        self.stream.po_token = new_po_token
+        self.browser_like_enabled = self.browser_like_enabled or self.sabr_po_token_source is not None
+        self.sabr_contexts_to_send = []
+        self.sabr_unsent_contexts = []
+        self.sabr_context_updates = dict()
+        self.RELOAD = False
+        self.maximum_reload_attempt = max(self.maximum_reload_attempt, 1)
+
+        refresh_url = self.youtube.server_abr_streaming_url
+        if not refresh_url:
+            logger.warning("SABR PoToken refresh did not produce a refreshed ABR URL")
+            return False
+
+        self.server_abr_streaming_url = refresh_url
+        self.video_playback_ustreamer_config = self.youtube.video_playback_ustreamer_config
+        self.stream.url = refresh_url
+        if self.browser_like_enabled:
+            self.server_abr_streaming_url = self._strip_url_query_param(
+                self.server_abr_streaming_url,
+                "pot",
+            )
+            self.stream.url = self.server_abr_streaming_url
+        self.stream.video_playback_ustreamer_config = self.video_playback_ustreamer_config
+        self.stream_protection_status = PoTokenStatus.UNKNOWN.name
+        logger.warning(
+            "SABR PoToken refresh complete; token_changed=%s, retrying media request",
+            new_po_token != old_po_token,
+        )
+        return True
+
+    def _build_sabr_client_metadata(self):
+        try:
+            innertube = InnerTube(self.youtube.client)
+            client_context = innertube.innertube_context["context"]["client"]
+            client_name = innertube.header.get("X-Youtube-Client-Name", "1")
+            client_version = (
+                innertube.header.get("X-Youtube-Client-Version")
+                or client_context.get("clientVersion")
+                or "2.20251021.01.00"
+            )
+            if os.environ.get("PYTUBEFIX_SABR_BROWSER_LIKE") == "1" and self.youtube.client == "WEB":
+                client_version = os.environ.get(
+                    "PYTUBEFIX_SABR_BROWSER_CLIENT_VERSION",
+                    "2.20260428.00.00",
+                )
+            client_info = {
+                "clientName": int(client_name) if str(client_name).isdigit() else 1,
+                "clientVersion": client_version,
+                "osName": client_context.get("osName", "Windows"),
+                "osVersion": client_context.get("osVersion", "10.0"),
+                "platform": client_context.get("platform", "DESKTOP"),
+            }
+            headers = {
+                key: value
+                for key, value in innertube.header.items()
+                if key.startswith("X-Youtube-Client-")
+            }
+            return client_info, headers
+        except Exception:
+            return {
+                "clientName": 1,
+                "clientVersion": "2.20251021.01.00",
+                "osName": "Windows",
+                "osVersion": "10.0",
+                "platform": "DESKTOP",
+            }, {
+                "X-Youtube-Client-Name": "1",
+                "X-Youtube-Client-Version": "2.20251021.01.00",
+            }
+
     # Reference https://github.com/coletdjnz/yt-dlp-dev/blob/5c0c296/yt_dlp/extractor/youtube/_streaming/sabr/stream.py
     def process_sabr_context_update(self, data):
         sabr_ctx_update = StreamerContextUpdate.decode(data)
@@ -416,6 +709,8 @@ class ServerAbrStream:
             return
 
         self.sabr_context_updates[sabr_ctx_update["type"]] = sabr_ctx_update
+        if sabr_ctx_update["type"] in self.sabr_unsent_contexts:
+            self.sabr_unsent_contexts.remove(sabr_ctx_update["type"])
 
         timestamp = sabr_ctx_update.get("value", "").get("field1", "").get("timestamp", "")
         skip = sabr_ctx_update.get("value", "").get("field1", "").get("skip", "")
@@ -424,7 +719,11 @@ class ServerAbrStream:
         self.sabr_context_updates[sabr_ctx_update["type"]]["skip"] = skip
 
         if sabr_ctx_update["sendByDefault"] is True:
-            self.sabr_contexts_to_send.append(sabr_ctx_update["type"])
+            if sabr_ctx_update["type"] not in self.sabr_contexts_to_send:
+                self.sabr_contexts_to_send.append(sabr_ctx_update["type"])
+
+        if self.sabr_trace_enabled:
+            logger.warning("SABR context update: %s active=%s", sabr_ctx_update, self.sabr_contexts_to_send)
 
         logger.debug(f'Registered SabrContextUpdate')
         logger.debug(f"Current timestamp: {timestamp}")
@@ -471,12 +770,18 @@ class ServerAbrStream:
         # ContextUpdate is bound to server url
         self.sabr_contexts_to_send = []
         self.sabr_context_updates = dict()
+        self.sabr_unsent_contexts = []
 
         self.youtube.vid_info = None
         refresh_url = self.youtube.server_abr_streaming_url
         if not refresh_url:
             raise ValueError("Invalid SABR refresh")
         self.server_abr_streaming_url = refresh_url
+        if self.browser_like_enabled:
+            self.server_abr_streaming_url = self._strip_url_query_param(
+                self.server_abr_streaming_url,
+                "pot",
+            )
         self.video_playback_ustreamer_config = self.youtube.video_playback_ustreamer_config
 
     @staticmethod
@@ -485,3 +790,97 @@ class ServerAbrStream:
         padded_base64 = standard_base64 + '=' * ((4 - len(standard_base64) % 4) % 4)
         byte_data = base64.b64decode(padded_base64)
         return bytearray(byte_data)
+
+    def _build_selected_format_candidates(self):
+        current_format = self._stream_format_id(self.stream)
+        if not self.browser_like_enabled:
+            if self.stream.type == "audio":
+                return [current_format], []
+            return [], [current_format]
+
+        fmt_streams = getattr(self.youtube, "_fmt_streams", None) or []
+        sabr_streams = [
+            fmt_stream
+            for fmt_stream in fmt_streams
+            if getattr(fmt_stream, "is_sabr", False)
+        ]
+        audio_formats = [
+            self._stream_format_id(fmt_stream)
+            for fmt_stream in sabr_streams
+            if getattr(fmt_stream, "type", None) == "audio"
+        ]
+        video_formats = [
+            self._stream_format_id(fmt_stream)
+            for fmt_stream in sabr_streams
+            if getattr(fmt_stream, "type", None) == "video"
+        ]
+
+        if self.stream.type == "audio" and current_format not in audio_formats:
+            audio_formats.insert(0, current_format)
+        if self.stream.type == "video":
+            # Browser SABR requests include audio+video, but the caller still
+            # expects the exact Stream itag they selected.
+            video_formats = [current_format]
+
+        if self.sabr_po_token_source == "browser_sabr_capture":
+            logger.warning(
+                "SABR streams detected; using Playwright browser PoToken capture for this download."
+            )
+        elif self.sabr_po_token_source == "env":
+            logger.warning(
+                "SABR streams detected; using the manually supplied SABR PoToken."
+            )
+        else:
+            logger.warning(
+                "SABR streams detected; using browser-compatible SABR request handling."
+            )
+
+        if self.sabr_trace_enabled:
+            logger.warning(
+                "SABR browser-like format candidates: audio=%s video=%s target=%s",
+                len(audio_formats),
+                len(video_formats),
+                current_format,
+            )
+        return audio_formats, video_formats
+
+    @staticmethod
+    def _stream_format_id(stream):
+        xtags = getattr(stream, "xtags", None)
+        return {
+            "itag": stream.itag,
+            "lastModified": int(stream.last_Modified),
+            "xtags": xtags if xtags is not None else "",
+        }
+
+    def _selected_resolution(self, video_format):
+        if self.stream.resolution:
+            return int(self.stream.resolution.replace("p", ""))
+        if not video_format:
+            return 720
+        fmt_streams = getattr(self.youtube, "_fmt_streams", None) or []
+        resolutions = []
+        video_itags = {fmt["itag"] for fmt in video_format}
+        for fmt_stream in fmt_streams:
+            if getattr(fmt_stream, "itag", None) not in video_itags:
+                continue
+            resolution = getattr(fmt_stream, "resolution", None)
+            if not resolution:
+                continue
+            try:
+                resolutions.append(int(str(resolution).replace("p", "")))
+            except ValueError:
+                continue
+        return max(resolutions) if resolutions else 720
+
+    @staticmethod
+    def _strip_url_query_param(url, param_name):
+        parts = urlsplit(url)
+        query = [
+            (key, value)
+            for key, value in parse_qsl(parts.query, keep_blank_values=True)
+            if key != param_name
+        ]
+        return urlunsplit(
+            (parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment)
+        )

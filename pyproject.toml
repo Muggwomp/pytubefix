@@ -35,6 +35,9 @@ classifiers = [
 ]
 dependencies = ["aiohttp >=3.12.13", "nodejs-wheel-binaries >= 22.20.0"]
 
+[project.optional-dependencies]
+sabr = ["playwright >=1.44.0"]
+
 [project.urls]
 "Homepage" = "https://github.com/juanbindez/pytubefix"
 "Bug Reports" = "https://github.com/juanbindez/pytubefix/issues"
