@@ -407,8 +407,7 @@ class Stream:
                         bytes_remaining -= len(chunk)
                         write_chunk(chunk, bytes_remaining)
                 else:
-                    logger.debug('This stream is SABR. Starting ServerAbrStream')
-                    ServerAbrStream(stream=self, write_chunk=write_chunk, monostate=self._monostate).start()
+                    self._download_sabr(write_chunk)
 
             except HTTPError as e:
                 if e.code != 404:
@@ -428,11 +427,25 @@ class Stream:
                         bytes_remaining -= len(chunk)
                         write_chunk(chunk, bytes_remaining)
                 else:
-                    logger.debug('This stream is SABR. Starting ServerAbrStream')
-                    ServerAbrStream(stream=self, write_chunk=write_chunk, monostate=self._monostate).start()
+                    self._download_sabr(write_chunk)
 
             self.on_complete(file_path)
             return file_path
+
+    def _download_sabr(self, write_chunk: Callable[[bytes, int], None]) -> None:
+        if getattr(self._monostate.youtube, "sabr_browser_fallback", False):
+            from pytubefix.sabr.browser_stream import BrowserSabrStream
+
+            logger.debug('This stream is SABR. Starting BrowserSabrStream')
+            BrowserSabrStream(
+                stream=self,
+                write_chunk=write_chunk,
+                monostate=self._monostate,
+            ).start()
+            return
+
+        logger.debug('This stream is SABR. Starting ServerAbrStream')
+        ServerAbrStream(stream=self, write_chunk=write_chunk, monostate=self._monostate).start()
 
     def get_file_path(
         self,

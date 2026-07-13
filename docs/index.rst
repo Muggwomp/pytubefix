@@ -56,6 +56,7 @@ of pytubefix.
    user/install
    user/quickstart
    user/streams
+   user/sabr_browser
    user/auth
    user/m4a
    user/captions

@@ -141,8 +141,10 @@ test/**/*.xml
 
 # Common virtual environments
 .virtualenv
+.venv/
 venv/
 env/
+.tmp/
 
 # Token cache location
 __cache__/

@@ -63,6 +63,7 @@ class YouTube:
             oauth_verifier: Optional[Callable[[str, str], None]] = None,
             use_po_token: Optional[bool] = False,
             po_token_verifier: Optional[Callable[[None], Tuple[str, str]]] = None,
+            sabr_browser_fallback: bool = False,
     ):
         """Construct a :class:`YouTube <YouTube>`.
 
@@ -96,6 +97,10 @@ class YouTube:
             (optional) Verifier to be used for getting oauth tokens.
             Verification URL and User-Code will be passed to it respectively.
             (if passed, else default verifier will be used)
+        :param bool sabr_browser_fallback:
+            (Optional) Let YouTube's browser player perform SABR negotiation and
+            feed the selected stream back through Stream.download(). Requires the
+            optional Playwright package and browser runtime.
         """
         # js fetched by js_url
         self._js: Optional[str] = None
@@ -141,6 +146,7 @@ class YouTube:
             on_progress=on_progress_callback, on_complete=on_complete_callback, youtube=self
         )
 
+        self.proxies = proxies
         if proxies:
             install_proxy(proxies)
 
@@ -165,6 +171,7 @@ class YouTube:
 
         self.po_token = None
         self._pot = None
+        self.sabr_browser_fallback = sabr_browser_fallback
 
     def __repr__(self):
         return f'<pytubefix.__main__.YouTube object: videoId={self.video_id}>'
