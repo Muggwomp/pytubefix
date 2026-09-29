@@ -2,14 +2,17 @@
 
 set -e
 
-VERSION=10
-MINOR=11
+VERSION=11
+MINOR=1
 PATCH=0
 EXTRAVERSION=""
-COMMIT="(#667 #663)
+COMMIT="(#670 #676 #677 #678)
 
-Tested-by: Justin 'Muggwomp' Corey <justincorey@mindgarden.cc>
-Tested-by: Sai Asish Y <say.apm35@gmail.com>
+Tested-by: Folade <Foladeakhibi@gmail.com>
+Tested-by: Felipe Ucelli <felipe.ucelli@hotmail.com>
+Inspired-by: @LuanRT https://github.com/LuanRT/BgUtils
+Fixes: #675
+
 "
 BRANCH="main"
 
