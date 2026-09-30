@@ -28,9 +28,34 @@ from pytubefix.sabr.video_streaming.format_initialization_metadata import (
     FormatInitializationMetadata,
 )
 from pytubefix.sabr.video_streaming.media_header import MediaHeader
+from pytubefix.sabr.browser_session import (
+    browser_mode,
+    browser_profile_dir,
+    close_persistent_context,
+    launch_options as browser_launch_options,
+    open_persistent_context,
+)
 
 
 logger = logging.getLogger(__name__)
+
+
+class CaptureDeadline:
+    """Bound stalls, while allowing a progressing movie to finish."""
+
+    def __init__(self, idle_timeout: float, hard_timeout: float = 0):
+        self.started = self.last_progress = time.monotonic()
+        self.idle_timeout = idle_timeout
+        self.hard_timeout = hard_timeout
+        self.downloaded = 0
+
+    def active(self, downloaded: int) -> bool:
+        now = time.monotonic()
+        if downloaded > self.downloaded:
+            self.downloaded = downloaded
+            self.last_progress = now
+        return (now - self.last_progress < self.idle_timeout and
+                (self.hard_timeout <= 0 or now - self.started < self.hard_timeout))
 
 
 @dataclass
@@ -47,6 +72,10 @@ class BrowserCapture:
     mime_type: Optional[str] = None
     next_sequence: int = 0
     total_bytes: int = 0
+    progress_callback: Optional[Callable[[bytes, int], None]] = field(
+        default=None,
+        repr=False,
+    )
     spool: Any = field(
         default_factory=lambda: tempfile.SpooledTemporaryFile(
             max_size=64 * 1024 * 1024,
@@ -66,6 +95,8 @@ class BrowserCapture:
 
     def add_chunk(self, header: MediaHeader, chunk: bytes) -> bool:
         sequence = int(header.sequenceNumber or 0)
+        if sequence < self.next_sequence:
+            return False  # Already written; replay must not count as progress.
         expected = int(header.contentLength or 0)
         if expected:
             self.expected_lengths[sequence] = expected
@@ -89,6 +120,8 @@ class BrowserCapture:
         return True
 
     def mark_ended(self, sequence: int) -> None:
+        if sequence < self.next_sequence:
+            return
         self.ended_sequences.add(sequence)
         self._flush_ready()
 
@@ -106,6 +139,8 @@ class BrowserCapture:
             for chunk in self.chunks.pop(self.next_sequence):
                 self.spool.write(chunk)
                 self.total_bytes += len(chunk)
+                if self.progress_callback is not None:
+                    self.progress_callback(chunk, self.total_bytes)
             self.hashes.pop(self.next_sequence, None)
             self.ended_sequences.discard(self.next_sequence)
             self.next_sequence += 1
@@ -154,6 +189,10 @@ class SourceBufferCapture:
     finished: bool = False
     last_append_at: float = field(default_factory=time.time)
     mime_type: Optional[str] = None
+    progress_callback: Optional[Callable[[bytes, int], None]] = field(
+        default=None,
+        repr=False,
+    )
     spool: Any = field(
         default_factory=lambda: tempfile.SpooledTemporaryFile(
             max_size=64 * 1024 * 1024,
@@ -183,6 +222,8 @@ class SourceBufferCapture:
         self.total_bytes += len(chunk)
         self.append_count += 1
         self.last_append_at = time.time()
+        if self.progress_callback is not None:
+            self.progress_callback(chunk, self.total_bytes)
         return True
 
     def complete(self) -> bool:
@@ -205,19 +246,30 @@ class SourceBufferCapture:
 class BrowserSabrStream:
     """Download one exact SABR representation through YouTube's browser player."""
 
-    def __init__(self, stream, write_chunk: Callable[[bytes, int], None], monostate) -> None:
+    def __init__(
+        self,
+        stream,
+        write_chunk: Callable[[bytes, int], None],
+        monostate,
+        progress_callback: Optional[Callable[[bytes, int], None]] = None,
+        write_complete_chunk: Optional[Callable[[bytes, int], None]] = None,
+    ) -> None:
         self.stream = stream
         self.write_chunk = write_chunk
+        self.write_complete_chunk = write_complete_chunk or write_chunk
+        self.progress_callback = progress_callback
         self.youtube = monostate.youtube
         self.headers_by_id: Dict[int, MediaHeader] = {}
         self.capture = BrowserCapture(
             itag=int(stream.itag),
             last_modified=int(stream.last_Modified or 0),
             xtags=stream.xtags or "",
+            progress_callback=self._report_capture_progress,
         )
         self.source_capture = SourceBufferCapture(
             itag=int(stream.itag),
             stream_type=stream.type,
+            progress_callback=self._report_capture_progress,
         )
         self.source_buffer_mode = self._use_source_buffer_capture()
         self.source_player_state: Dict[str, Any] = {}
@@ -225,6 +277,7 @@ class BrowserSabrStream:
         self.observed_itags: Set[int] = set()
         self.last_media_at = time.time()
         self.player_error = ""
+        self._persistent_profile_lock = None
 
     def start(self) -> None:
         try:
@@ -247,10 +300,19 @@ class BrowserSabrStream:
                     browser, context = self._create_context(playwright)
                     self._capture(context)
                 finally:
-                    if context is not None:
-                        context.close()
-                    if browser is not None:
-                        browser.close()
+                    try:
+                        if context is not None:
+                            if self._persistent_profile_lock is not None:
+                                close_persistent_context(
+                                    context,
+                                    self._persistent_profile_lock,
+                                )
+                                self._persistent_profile_lock = None
+                            else:
+                                context.close()
+                    finally:
+                        if browser is not None:
+                            browser.close()
 
             output_capture = self.source_capture if self.source_buffer_mode else self.capture
             if not output_capture.complete():
@@ -278,10 +340,22 @@ class BrowserSabrStream:
             bytes_remaining = total_bytes
             for chunk in output_capture.iter_chunks():
                 bytes_remaining -= len(chunk)
-                self.write_chunk(chunk, max(0, bytes_remaining))
+                # Progress was already reported while the browser captured
+                # each chunk.  Only write the final verified spool here so
+                # callers do not see every byte twice.
+                self.write_complete_chunk(chunk, max(0, bytes_remaining))
         finally:
             self.capture.close()
             self.source_capture.close()
+
+    def _report_capture_progress(self, chunk: bytes, downloaded_bytes: int) -> None:
+        """Report captured bytes without writing the unverified spool."""
+        if self.progress_callback is None:
+            return
+
+        expected_bytes = int(getattr(self.stream, "_filesize", 0) or 0)
+        bytes_remaining = max(0, expected_bytes - downloaded_bytes)
+        self.progress_callback(chunk, bytes_remaining)
 
     def parse_response(self, body: bytes) -> int:
         accepted = 0
@@ -368,47 +442,21 @@ class BrowserSabrStream:
         return codec.startswith(("vp9", "vp09", "av1", "av01")) or "opus" in codec
 
     def _create_context(self, playwright) -> Tuple[Any, Any]:
-        mode = os.environ.get("PYTUBEFIX_SABR_BROWSER_MODE", "auto").lower()
-        if mode not in {"auto", "headless", "headed", "hidden-headed"}:
-            raise SABRError(
-                "PYTUBEFIX_SABR_BROWSER_MODE must be auto, headless, headed, or hidden-headed"
+        mode = browser_mode()
+        launch_options = browser_launch_options(self.youtube, mode)
+        profile_dir = browser_profile_dir(self.youtube)
+        if profile_dir:
+            # A persistent context owns its browser process.  The profile lock
+            # is shared with BrowserPlayerSession so login state is never read
+            # while another worker has the profile open.
+            context, lock = open_persistent_context(
+                playwright,
+                profile_dir,
+                youtube=self.youtube,
+                mode=mode,
             )
-        if mode == "auto":
-            if platform.system() == "Windows":
-                mode = "hidden-headed"
-            elif os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
-                mode = "headed"
-            else:
-                mode = "headless"
-
-        launch_args = [
-            "--autoplay-policy=no-user-gesture-required",
-            "--disable-blink-features=AutomationControlled",
-            "--disable-features=AutomationControlled",
-            "--disable-infobars",
-            "--mute-audio",
-        ]
-        headless = mode == "headless"
-        if mode == "hidden-headed":
-            launch_args.extend([
-                "--window-size=1280,720",
-                "--window-position=-32000,-32000",
-            ])
-
-        launch_options: Dict[str, Any] = {
-            "headless": headless,
-            "args": launch_args,
-            "timeout": self._env_int("PYTUBEFIX_SABR_BROWSER_LAUNCH_TIMEOUT_MS", 60000),
-        }
-        channel = os.environ.get("PYTUBEFIX_SABR_BROWSER_CHANNEL", "").strip()
-        if channel:
-            launch_options["channel"] = channel
-        executable = os.environ.get("PYTUBEFIX_SABR_BROWSER_PATH", "").strip()
-        if executable:
-            launch_options["executable_path"] = executable
-        proxy = self._playwright_proxy(getattr(self.youtube, "proxies", None))
-        if proxy:
-            launch_options["proxy"] = proxy
+            self._persistent_profile_lock = lock
+            return None, context
 
         browser = playwright.chromium.launch(**launch_options)
         context = browser.new_context(
@@ -477,6 +525,12 @@ class BrowserSabrStream:
         return result
 
     def _capture(self, context) -> None:
+        if self._persistent_profile_lock is not None:
+            # Persistent contexts also need the selected codec constraints.
+            self._install_codec_preference(context)
+            disabled = self._disabled_codecs()
+            if disabled:
+                self._install_codec_mask(context, disabled)
         if self.source_buffer_mode:
             logger.info("Installing SABR SourceBuffer capture hook")
             self._install_source_buffer_capture(context)
@@ -511,22 +565,29 @@ class BrowserSabrStream:
         logger.info("SABR browser video element ready")
         self._move_window_offscreen(page)
         self._wait_for_main_video(page)
+        self._disable_autonav(page)
+        self._install_end_guard(page)
         logger.info("Starting SABR browser playback")
         self._start_playback(page)
         logger.info("SABR browser playback started")
 
-        timeout = self._env_int("PYTUBEFIX_SABR_BROWSER_CAPTURE_TIMEOUT", 240)
-        deadline = time.time() + timeout
+        deadline = CaptureDeadline(
+            max(1, self._env_int("PYTUBEFIX_SABR_BROWSER_IDLE_TIMEOUT", 240)),
+            self._env_int("PYTUBEFIX_SABR_BROWSER_CAPTURE_TIMEOUT", 0),
+        )
         if self.source_buffer_mode:
             self._capture_source_buffer(page, deadline)
             return
 
         last_progress_at = 0.0
-        while time.time() < deadline and not self.capture.complete():
+        last_recovery_at = time.monotonic()
+        while not self.capture.complete() and deadline.active(self.capture.total_bytes):
             page.wait_for_timeout(500)
             self._keep_playing(page)
-            if time.time() - self.last_media_at > 5:
+            now = time.monotonic()
+            if now - deadline.last_progress > 10 and now - last_recovery_at > 10:
                 self._seek_to_missing_segment(page)
+                last_recovery_at = now
             if time.time() - last_progress_at >= 5:
                 logger.info(
                     "SABR browser download itag %s: %.1f%% (%s/%s segments)",
@@ -539,6 +600,7 @@ class BrowserSabrStream:
                 last_progress_at = time.time()
 
         if not self.capture.complete():
+            logger.warning("SABR capture stopped after a progress stall or configured time limit")
             self.player_error = self._player_error(page)
             if self.player_error:
                 logger.warning("YouTube browser player error: %s", self.player_error)
@@ -626,10 +688,10 @@ class BrowserSabrStream:
                     pass
             self.source_capture.add(payload)
 
-    def _capture_source_buffer(self, page, deadline: float) -> None:
+    def _capture_source_buffer(self, page, deadline: CaptureDeadline) -> None:
         last_progress_at = 0.0
         target_seen = False
-        while time.time() < deadline and not self.source_capture.finished:
+        while not self.source_capture.finished and deadline.active(self.source_capture.total_bytes):
             page.wait_for_timeout(250)
             self._drain_source_buffers(page)
             self._keep_playing(page)
@@ -642,6 +704,7 @@ class BrowserSabrStream:
                             currentTime: Number(video?.currentTime || 0),
                             duration: Number(video?.duration || 0),
                             ended: Boolean(video?.ended),
+                            targetEnded: Boolean(window.__pytubefixSabrTargetEnded),
                             paused: Boolean(video?.paused),
                             fmt: String(stats.fmt || ''),
                             afmt: String(stats.afmt || ''),
@@ -655,7 +718,8 @@ class BrowserSabrStream:
             active_itag = state.get("fmt") if self.stream.type == "video" else state.get("afmt")
             if str(active_itag or "") == str(self.stream.itag):
                 target_seen = True
-            elif target_seen and active_itag:
+            target_ended = bool(state.get("ended")) or bool(state.get("targetEnded"))
+            if target_seen and active_itag and str(active_itag) != str(self.stream.itag) and not target_ended:
                 self.source_target_interrupted = True
             for key in ("fmt", "afmt"):
                 try:
@@ -666,7 +730,7 @@ class BrowserSabrStream:
 
             current_time = float(state.get("currentTime") or 0)
             duration = float(state.get("duration") or 0)
-            at_end = bool(state.get("ended")) or (
+            at_end = target_ended or (
                 duration > 0 and current_time >= max(0, duration - 0.35)
             )
             append_idle = time.time() - self.source_capture.last_append_at >= 1.0
@@ -699,6 +763,67 @@ class BrowserSabrStream:
             if self.player_error:
                 logger.warning("YouTube browser player error: %s", self.player_error)
 
+    def _disable_autonav(self, page) -> None:
+        """Prevent YouTube from replacing the target with the next video."""
+        try:
+            disabled = page.evaluate(
+                """() => {
+                    const player = document.getElementById('movie_player');
+                    let changed = false;
+                    for (const method of ['setAutonavState', 'setAutonavEnabled']) {
+                        if (player && typeof player[method] === 'function') {
+                            try {
+                                player[method](false);
+                                changed = true;
+                            } catch (_) {}
+                        }
+                    }
+                    const toggle = document.querySelector('.ytp-autonav-toggle-button');
+                    if (toggle && toggle.getAttribute('aria-checked') === 'true') {
+                        try {
+                            toggle.click();
+                            changed = true;
+                        } catch (_) {}
+                    }
+                    const video = document.querySelector('video');
+                    if (video) video.loop = false;
+                    return changed;
+                }"""
+            )
+            if disabled:
+                logger.debug("Disabled YouTube autoplay navigation for SABR capture")
+        except Exception:
+            logger.debug("Unable to disable YouTube autoplay navigation", exc_info=True)
+
+    def _install_end_guard(self, page) -> None:
+        """Pause the selected video when it ends before YouTube advances."""
+        try:
+            page.evaluate(
+                """() => {
+                    window.__pytubefixSabrTargetEnded = false;
+                    const attach = () => {
+                        const video = document.querySelector('video');
+                        if (!video || video.__pytubefixSabrEndGuard) return;
+                        video.__pytubefixSabrEndGuard = true;
+                        video.addEventListener('ended', () => {
+                            window.__pytubefixSabrTargetEnded = true;
+                            try { video.pause(); } catch (_) {}
+                        }, true);
+                    };
+                    attach();
+                    if (!window.__pytubefixSabrEndObserver) {
+                        const observer = new MutationObserver(attach);
+                        observer.observe(document.documentElement, {
+                            childList: true,
+                            subtree: true,
+                        });
+                        window.__pytubefixSabrEndObserver = observer;
+                    }
+                }"""
+            )
+        except Exception:
+            logger.debug("Unable to install SABR video end guard", exc_info=True)
+
     def _start_playback(self, page) -> None:
         playback_rate = self._env_float("PYTUBEFIX_SABR_BROWSER_PLAYBACK_RATE", 16.0)
         page.locator("video").evaluate(
@@ -727,6 +852,10 @@ class BrowserSabrStream:
                 """(video, value) => {
                     video.muted = true;
                     video.playbackRate = value;
+                    if (window.__pytubefixSabrTargetEnded) {
+                        video.pause();
+                        return;
+                    }
                     if (video.paused && !video.ended) video.play();
                 }""",
                 rate,
@@ -738,20 +867,20 @@ class BrowserSabrStream:
         end = self.capture.end_segment_number
         if end is None or end < 1:
             return
-        missing = next(
-            (sequence for sequence in range(end + 1) if sequence not in self.capture.chunks),
-            None,
-        )
-        if missing is None:
+        # Completed sequences are removed from chunks after spooling. Searching
+        # that mapping from zero seeks to old data instead of the actual gap.
+        missing = self.capture.next_sequence
+        if missing > end:
             return
         duration_seconds = float(self.stream.durationMs or 0) / 1000
         seek_seconds = max(0.0, duration_seconds * missing / (end + 1) - 1.0)
         try:
+            if page.evaluate("() => Boolean(window.__pytubefixSabrTargetEnded)") is True:
+                return
             page.locator("video").evaluate(
                 "(video, second) => { video.currentTime = second; video.play(); }",
                 seek_seconds,
             )
-            self.last_media_at = time.time()
         except Exception:
             pass
 

@@ -42,6 +42,29 @@ Enable the backend on a YouTube instance and use the normal stream API::
     stream = yt.streams.get_by_itag(136)
     stream.download()
 
+Authenticated browser profile
+-----------------------------
+
+Age-restricted videos may require the cookies from a browser session that can
+play the video normally.  Pass a persistent Chromium profile directory to
+reuse that session for both player metadata and browser-assisted SABR capture::
+
+    yt = YouTube(
+        "https://www.youtube.com/watch?v=VIDEO_ID",
+        client="WEB",
+        sabr_browser_fallback=True,
+        sabr_browser_profile_dir="path/to/pytubefix-profile",
+    )
+
+The first run must open that profile in ``headed`` mode so the user can sign
+in and complete any age verification.  The profile contains sensitive browser
+cookies; keep it private and do not commit or share it.
+
+The environment variable ``PYTUBEFIX_SABR_BROWSER_PROFILE_DIR`` can be used
+instead of the constructor argument.  When a profile is configured, a
+login-gated HTTP player response is replaced with the authenticated browser's
+playable player response before streams are enumerated.
+
 The selected stream remains a single audio-only or video-only representation.
 Downloading separate adaptive audio and video streams still requires muxing if
 a combined output is desired.
@@ -82,7 +105,13 @@ Additional environment settings include:
     Explicit browser executable path.
 
 ``PYTUBEFIX_SABR_BROWSER_CAPTURE_TIMEOUT``
-    Maximum capture time in seconds. The default is 240.
+    Optional maximum capture time in seconds. Default: 0 (no overall limit).
+    An explicit positive value still enforces a hard time limit.
+
+``PYTUBEFIX_SABR_BROWSER_IDLE_TIMEOUT``
+    Maximum time without forward capture progress, in seconds. Default: 240.
+    Long downloads continue while progressing. UMP recovery seeks to the first
+    unfinished segment; replaying completed segments does not extend this limit.
 
 ``PYTUBEFIX_SABR_BROWSER_PLAYBACK_RATE``
     Browser playback rate used while acquiring segments. The default is 16.

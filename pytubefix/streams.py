@@ -391,6 +391,11 @@ class Stream:
             # send to the on_progress callback.
             self.on_progress(chunk_, fh, bytes_remaining_)
 
+        def write_complete_chunk(chunk_, bytes_remaining_):
+            # The browser SABR backend reports progress while capturing, then
+            # writes the verified spool without reporting those bytes again.
+            fh.write(chunk_)
+
 
         with open(file_path, "wb") as fh:
             try:
@@ -407,7 +412,7 @@ class Stream:
                         bytes_remaining -= len(chunk)
                         write_chunk(chunk, bytes_remaining)
                 else:
-                    self._download_sabr(write_chunk)
+                    self._download_sabr(write_chunk, write_complete_chunk)
 
             except HTTPError as e:
                 if e.code != 404:
@@ -427,12 +432,16 @@ class Stream:
                         bytes_remaining -= len(chunk)
                         write_chunk(chunk, bytes_remaining)
                 else:
-                    self._download_sabr(write_chunk)
+                    self._download_sabr(write_chunk, write_complete_chunk)
 
             self.on_complete(file_path)
             return file_path
 
-    def _download_sabr(self, write_chunk: Callable[[bytes, int], None]) -> None:
+    def _download_sabr(
+        self,
+        write_chunk: Callable[[bytes, int], None],
+        write_complete_chunk: Optional[Callable[[bytes, int], None]] = None,
+    ) -> None:
         if getattr(self._monostate.youtube, "sabr_browser_fallback", False):
             from pytubefix.sabr.browser_stream import BrowserSabrStream
 
@@ -441,6 +450,8 @@ class Stream:
                 stream=self,
                 write_chunk=write_chunk,
                 monostate=self._monostate,
+                progress_callback=self.on_progress_for_chunks,
+                write_complete_chunk=write_complete_chunk,
             ).start()
             return
 

@@ -64,6 +64,7 @@ class YouTube:
             use_po_token: Optional[bool] = False,
             po_token_verifier: Optional[Callable[[None], Tuple[str, str]]] = None,
             sabr_browser_fallback: bool = False,
+            sabr_browser_profile_dir: Optional[str] = None,
     ):
         """Construct a :class:`YouTube <YouTube>`.
 
@@ -101,6 +102,10 @@ class YouTube:
             (Optional) Let YouTube's browser player perform SABR negotiation and
             feed the selected stream back through Stream.download(). Requires the
             optional Playwright package and browser runtime.
+        :param str sabr_browser_profile_dir:
+            (Optional) Persistent Chromium profile directory for authenticated
+            browser player access. The profile's cookies are used only inside
+            Playwright and are never copied into pytubefix HTTP requests.
         """
         # js fetched by js_url
         self._js: Optional[str] = None
@@ -172,6 +177,7 @@ class YouTube:
         self.po_token = None
         self._pot = None
         self.sabr_browser_fallback = sabr_browser_fallback
+        self.sabr_browser_profile_dir = sabr_browser_profile_dir
 
     def __repr__(self):
         return f'<pytubefix.__main__.YouTube object: videoId={self.video_id}>'
@@ -558,7 +564,34 @@ class YouTube:
         if not innertube_response:
             raise pytubefix.exceptions.InnerTubeResponseError(self.video_id, self.client)
 
+        # Age-verified browser sessions can receive a playable response even
+        # when the stateless WEB/TV player request is login-gated.  Use the
+        # browser response as the source of stream metadata; the same profile
+        # is later reused by BrowserSabrStream for media capture.
+        if self.sabr_browser_profile_dir and self._needs_browser_player(innertube_response):
+            from pytubefix.sabr.browser_session import BrowserPlayerSession
+
+            browser_response = BrowserPlayerSession(self).fetch_player_info()
+            if browser_response:
+                self.client = "WEB"
+                try:
+                    self._visitor_data = browser_response["responseContext"]["visitorData"]
+                except (KeyError, TypeError):
+                    pass
+                innertube_response = browser_response
+
         return innertube_response
+
+    @staticmethod
+    def _needs_browser_player(response: Dict[str, Any]) -> bool:
+        playability = response.get("playabilityStatus", {})
+        status = playability.get("status")
+        reason = str(playability.get("reason", "")).lower()
+        return status in {"LOGIN_REQUIRED", "AGE_CHECK_REQUIRED"} or (
+            status == "UNPLAYABLE" and any(
+                marker in reason for marker in ("sign in", "confirm your age", "not a bot")
+            )
+        )
 
     @property
     def vid_details(self):
