@@ -2,15 +2,17 @@
 
 set -e
 
-VERSION=10
-MINOR=11
+VERSION=11
+MINOR=2
 PATCH=0
 EXTRAVERSION=""
-COMMIT="(#667 #663)
+COMMIT="(#680 #681)
 
-Tested-by: Justin 'Muggwomp' Corey <justincorey@mindgarden.cc>
-Tested-by: Sai Asish Y <say.apm35@gmail.com>
+Tested-by: yamoaharmahalfred-create <yamoaharmahalfred@gmail.com>
+Tested-by: mrhard9090 <74858909+mrhard9090@users.noreply.github.com>
+Fixes: #679
 "
+
 BRANCH="main"
 
 if [[ -z $PATCH ]]; then
