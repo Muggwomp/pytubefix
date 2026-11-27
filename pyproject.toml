@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pytubefix"
-version = "11.2.0"
+version = "11.3.0"
 
 authors = [
   { name="Juan Bindez", email="juanbindez780@gmail.com" },
@@ -47,7 +47,8 @@ classifiers = [
 
 dependencies = [
     "aiohttp >=3.12.13",
-    "nodejs-wheel-binaries >= 22.20.0"
+    "nodejs-wheel-binaries>=22.20.0; sys_platform != 'darwin'",
+    "nodejs-wheel-binaries==22.20.0; sys_platform == 'darwin'",
 ]
 
 [project.optional-dependencies]
