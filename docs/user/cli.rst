@@ -81,6 +81,14 @@ the highest quality available:
     $ pytubefix -r 1080p https://www.youtube.com/watch?v=2lAe1cqCOXo
     $ pytubefix -r best https://www.youtube.com/watch?v=2lAe1cqCOXo
 
+Use ``-B`` (``--sabr-browser``) to download SABR streams through Playwright.
+The flag selects WEB for stream discovery unless ``--oauth`` selects TV.
+See :ref:`sabr_browser` for browser setup.
+
+.. code:: bash
+
+    $ pytubefix download -B -r 1080p "https://www.youtube.com/watch?v=VIDEO_ID"
+
 Options for ``download`` and ``playlist``:
 
 .. list-table::
@@ -97,6 +105,8 @@ Options for ``download`` and ``playlist``:
      - Download the stream with this itag.
    * - ``-r RES``, ``--resolution RES``
      - ``720p``, ``1080p``, ... or ``best``. Merges video and audio with ffmpeg when needed.
+   * - ``-B``, ``--sabr-browser``
+     - Use Playwright for selected SABR streams.
    * - ``-o PATH``, ``--output PATH``
      - Output file or directory. ``-`` writes to stdout.
    * - ``-f``, ``--force``
@@ -203,6 +213,9 @@ Listing streams
 .. code:: bash
 
     $ pytubefix streams https://www.youtube.com/watch?v=2lAe1cqCOXo
+
+Use ``pytubefix streams -B URL`` to list formats with the same client as a
+browser-assisted download.
 
 On a terminal this prints an aligned table with a header. When piped, it
 prints tab-separated columns without a header, which is easy to parse:

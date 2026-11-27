@@ -355,6 +355,12 @@ def collect_urls(args, parser):
 
 def make_yt(url, args):
     kwargs = {"use_oauth": True, "allow_oauth_cache": True} if args.oauth else {}
+    if getattr(args, "sabr_browser", False):
+        from pytubefix.sabr.browser_session import browser_profile_dir
+
+        kwargs.update(sabr_browser_fallback=True, sabr_browser_profile_dir=browser_profile_dir())
+        if not args.oauth:
+            kwargs["client"] = "WEB"
     return YouTube(url, **kwargs)
 
 
@@ -398,12 +404,13 @@ def collection_dir(collection, kind):
 def choose(yt, args):
     """Returns [stream] or [video_stream, audio_stream] (to be merged)."""
     streams = yt.streams
+    stream_command = f"{PROG} streams{' -B' if getattr(args, 'sabr_browser', False) else ''} URL"
 
     if args.itag is not None:
         stream = streams.get_by_itag(args.itag)
 
         if stream is None:
-            raise CliError(f"itag {args.itag} is not available (see: {PROG} streams URL)")
+            raise CliError(f"itag {args.itag} is not available (see: {stream_command})")
 
         return [stream]
 
@@ -414,7 +421,7 @@ def choose(yt, args):
         best = max(audio, key=abr_value, default=None)
 
         if best is None:
-            raise CliError(f"no {fmt} audio stream available (see: {PROG} streams URL)")
+            raise CliError(f"no {fmt} audio stream available (see: {stream_command})")
 
         return [best]
 
@@ -452,7 +459,7 @@ def choose(yt, args):
         candidates = [s for s in video_only if res_value(s) == want]
 
         if not candidates:
-            raise CliError(f"no {want}p stream available (see: {PROG} streams URL)")
+            raise CliError(f"no {want}p stream available (see: {stream_command})")
 
         best_v = max(candidates, key=quality)
 
@@ -811,11 +818,17 @@ def common_parent():
     return p
 
 
+def add_sabr_browser_option(p):
+    p.add_argument("-B", "--sabr-browser", action="store_true",
+                   help="use browser-assisted SABR (WEB client unless --oauth is set)")
+
+
 def add_download_options(p, playlist_mode):
     what = "playlist or channel URLs, or playlist ids" if playlist_mode \
         else "video, playlist or channel URLs"
     p.add_argument("urls", nargs="*", metavar="URL",
                    help=f"{what} ('-': read from stdin)")
+    add_sabr_browser_option(p)
 
     pick = p.add_mutually_exclusive_group()
     pick.add_argument("-a", "--audio", action="store_true",
@@ -870,6 +883,7 @@ def build_parser():
 
     st = sub.add_parser("streams", parents=[parent], help="list the available streams")
     st.add_argument("url", metavar="URL")
+    add_sabr_browser_option(st)
 
     info = sub.add_parser("info", parents=[parent], help="show video metadata")
     info.add_argument("url", metavar="URL")

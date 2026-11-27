@@ -30,6 +30,14 @@ Playwright-managed browser. For example, set
 Usage
 -----
 
+Enable the browser backend in the CLI with ``-B`` or ``--sabr-browser``.
+For a resolution such as 1080p, the CLI uses FFmpeg to combine separate video
+and audio tracks when needed.
+
+.. code:: bash
+
+    $ pytubefix download -B -r 1080p "https://www.youtube.com/watch?v=VIDEO_ID"
+
 Enable the backend on a YouTube instance and use the normal stream API::
 
     from pytubefix import YouTube
